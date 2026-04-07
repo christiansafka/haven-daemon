@@ -7,6 +7,25 @@ use uuid::Uuid;
 /// Unique identifier for a session.
 pub type SessionId = Uuid;
 
+/// A single match from a transcript search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptSearchMatch {
+    /// Byte offset into the decrypted plaintext stream where the match starts.
+    pub offset: u64,
+    /// 1-indexed line number in the plaintext stream.
+    pub line_number: u64,
+    /// Containing line with ANSI escape sequences stripped.
+    pub preview: String,
+}
+
+/// Result of a transcript search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptSearchResults {
+    pub matches: Vec<TranscriptSearchMatch>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
 /// The kind of session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]

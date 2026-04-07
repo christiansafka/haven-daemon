@@ -2,12 +2,88 @@ use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;
+use haven_protocol::{TranscriptSearchMatch, TranscriptSearchResults};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Maximum transcript size before truncation (10 MB of ciphertext).
-const MAX_TRANSCRIPT_SIZE: u64 = 10 * 1024 * 1024;
+pub type SearchMatch = TranscriptSearchMatch;
+pub type SearchResults = TranscriptSearchResults;
+
+/// Strip ANSI CSI/OSC escape sequences from a line so previews are readable.
+/// Keeps printable characters and tabs.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b && i + 1 < bytes.len() {
+            // ESC sequence
+            let next = bytes[i + 1];
+            if next == b'[' {
+                // CSI: ESC [ ... final byte in 0x40..=0x7e
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                continue;
+            } else if next == b']' {
+                // OSC: ESC ] ... BEL or ESC \
+                i += 2;
+                while i < bytes.len() && bytes[i] != 0x07 {
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == 0x07 {
+                    i += 1;
+                }
+                continue;
+            } else {
+                // Other 2-byte escape
+                i += 2;
+                continue;
+            }
+        }
+        if b == b'\t' || b >= 0x20 {
+            // Push one UTF-8 code point starting at i.
+            let ch_end = utf8_char_end(bytes, i);
+            out.push_str(&s[i..ch_end]);
+            i = ch_end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn utf8_char_end(bytes: &[u8], i: usize) -> usize {
+    let b = bytes[i];
+    let len = if b < 0x80 {
+        1
+    } else if b < 0xc0 {
+        1 // continuation byte, shouldn't start here
+    } else if b < 0xe0 {
+        2
+    } else if b < 0xf0 {
+        3
+    } else {
+        4
+    };
+    (i + len).min(bytes.len())
+}
+
+/// Maximum transcript size before truncation (100 MB of ciphertext).
+/// ML workloads can produce large amounts of output (training logs, nvidia-smi,
+/// long-running inference) — 10 MB was too aggressive and lost history on
+/// reattach. 100 MB at ~1 KB/line is roughly 100k lines per session.
+const MAX_TRANSCRIPT_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Each encrypted chunk: 4-byte length prefix (big-endian) + 12-byte nonce + ciphertext + 16-byte tag.
 /// We encrypt in chunks to allow append-only writes and partial reads.
@@ -161,6 +237,100 @@ impl TranscriptWriter {
     /// Get total bytes written (ciphertext, for size tracking).
     pub fn total_bytes(&self) -> u64 {
         self.bytes_written
+    }
+
+    /// Search the decrypted transcript for `pattern`. Returns up to `limit`
+    /// matches, each with its byte offset in the plaintext stream and a short
+    /// preview line (the containing line, clipped).
+    ///
+    /// `regex = false`: plain substring search (fast, cheap).
+    /// `regex = true`: `pattern` is compiled as a Rust regex.
+    /// `case_insensitive`: applies to both modes.
+    pub fn search(
+        &self,
+        pattern: &str,
+        case_insensitive: bool,
+        regex: bool,
+        limit: usize,
+    ) -> Result<SearchResults> {
+        if pattern.is_empty() {
+            return Ok(TranscriptSearchResults { matches: vec![], total: 0, truncated: false });
+        }
+
+        let all = self.read_all_plaintext()?;
+        // Scrub ANSI escape sequences for matching purposes only — we still
+        // return offsets into the raw stream so the client can replay around
+        // them, but matches on color codes would be useless noise.
+        let text = String::from_utf8_lossy(&all);
+
+        let mut matches: Vec<TranscriptSearchMatch> = Vec::new();
+        let mut total = 0usize;
+
+        let push_match = |matches: &mut Vec<TranscriptSearchMatch>, total: &mut usize, start: usize, end: usize| {
+            *total += 1;
+            if matches.len() >= limit {
+                return;
+            }
+            // Find line boundaries around the match.
+            let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line_end = text[end..]
+                .find('\n')
+                .map(|i| end + i)
+                .unwrap_or(text.len());
+            let raw_line = &text[line_start..line_end];
+            let preview = strip_ansi(raw_line);
+            // Line number = count of '\n' before line_start.
+            let line_number = text[..line_start].bytes().filter(|&b| b == b'\n').count() + 1;
+            matches.push(TranscriptSearchMatch {
+                offset: start as u64,
+                line_number: line_number as u64,
+                preview,
+            });
+        };
+
+        if regex {
+            let pat = if case_insensitive {
+                format!("(?i){pattern}")
+            } else {
+                pattern.to_string()
+            };
+            let re = regex::Regex::new(&pat)
+                .map_err(|e| anyhow::anyhow!("Invalid regex: {e}"))?;
+            for m in re.find_iter(&text) {
+                push_match(&mut matches, &mut total, m.start(), m.end());
+                if total > limit * 4 && matches.len() >= limit {
+                    break;
+                }
+            }
+        } else if case_insensitive {
+            let needle = pattern.to_lowercase();
+            let hay = text.to_lowercase();
+            let mut start = 0usize;
+            while let Some(idx) = hay[start..].find(&needle) {
+                let abs = start + idx;
+                push_match(&mut matches, &mut total, abs, abs + needle.len());
+                start = abs + needle.len().max(1);
+                if total > limit * 4 && matches.len() >= limit {
+                    break;
+                }
+            }
+        } else {
+            let mut start = 0usize;
+            while let Some(idx) = text[start..].find(pattern) {
+                let abs = start + idx;
+                push_match(&mut matches, &mut total, abs, abs + pattern.len());
+                start = abs + pattern.len().max(1);
+                if total > limit * 4 && matches.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(TranscriptSearchResults {
+            truncated: total > matches.len(),
+            matches,
+            total,
+        })
     }
 
     /// Read all chunks from the transcript file and decrypt them.

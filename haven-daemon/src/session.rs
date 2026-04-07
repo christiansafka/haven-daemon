@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::history::TranscriptWriter;
+use crate::history::{SearchResults, TranscriptWriter};
 use crate::pty::PtyHandle;
 
 /// A live session with its PTY and transcript.
@@ -179,6 +179,23 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
         let sess = session.lock().await;
         Ok(sess.pty.subscribe())
+    }
+
+    /// Search a session's full transcript.
+    pub async fn search_history(
+        &self,
+        id: &SessionId,
+        pattern: &str,
+        case_insensitive: bool,
+        regex: bool,
+        limit: usize,
+    ) -> Result<SearchResults> {
+        let session = self
+            .get(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+        let sess = session.lock().await;
+        sess.transcript.search(pattern, case_insensitive, regex, limit)
     }
 
     /// Get recent history for a session.

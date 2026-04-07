@@ -142,11 +142,19 @@ async fn handle_cli_action(
 ) -> Result<()> {
     match action {
         SessionAction::Create {
-            name, shell, cwd, cols, rows, json,
+            name, shell, cwd, cols, rows, env, json,
         } => {
             let mut stream = connect_daemon(socket_path).await?;
+            let mut env_map = std::collections::HashMap::new();
+            for entry in env {
+                if let Some((k, v)) = entry.split_once('=') {
+                    env_map.insert(k.to_string(), v.to_string());
+                } else {
+                    eprintln!("Warning: ignoring --env '{entry}' (expected KEY=VALUE)");
+                }
+            }
             let req = Request::SessionCreate(SessionCreate {
-                name, shell, cwd, cols, rows,
+                name, shell, cwd, cols, rows, env: env_map,
                 ..Default::default()
             });
             match send_request(&mut stream, 1, &req).await? {

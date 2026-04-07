@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::HavenError;
-use crate::session::{SessionCreate, SessionId, SessionInfo};
+use crate::session::{SessionCreate, SessionId, SessionInfo, TranscriptSearchResults};
 
 /// A request from the app to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +55,15 @@ pub enum Request {
         length: u64,
     },
 
+    /// Search a session's full durable history.
+    SessionSearchHistory {
+        session_id: SessionId,
+        pattern: String,
+        case_insensitive: bool,
+        regex: bool,
+        limit: u32,
+    },
+
     /// Ping the daemon.
     Ping,
 
@@ -99,6 +108,9 @@ pub enum Response {
         offset: u64,
         total: u64,
     },
+
+    /// Results of a transcript search.
+    SearchHistoryResults(TranscriptSearchResults),
 
     /// Pong response.
     Pong {

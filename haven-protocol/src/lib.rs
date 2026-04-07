@@ -9,7 +9,10 @@ pub use error::HavenError;
 pub use event::Event;
 pub use host::{AuthMethod, HostId, HostInfo};
 pub use message::{Request, Response};
-pub use session::{SessionCreate, SessionId, SessionInfo, SessionKind, SessionStatus, SessionTemplate};
+pub use session::{
+    SessionCreate, SessionId, SessionInfo, SessionKind, SessionStatus, SessionTemplate,
+    TranscriptSearchMatch, TranscriptSearchResults,
+};
 
 /// The default Unix socket path for the daemon.
 pub fn default_socket_path() -> std::path::PathBuf {

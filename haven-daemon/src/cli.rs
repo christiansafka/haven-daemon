@@ -60,6 +60,10 @@ pub enum SessionAction {
         #[arg(long, default_value_t = 24)]
         rows: u16,
 
+        /// Extra environment variables for the session shell (KEY=VALUE, repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -78,7 +82,7 @@ pub enum SessionAction {
         id: String,
 
         /// Bytes of history to replay
-        #[arg(long, default_value_t = 65536)]
+        #[arg(long, default_value_t = 1_048_576)]
         history_bytes: u64,
     },
 

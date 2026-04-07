@@ -395,6 +395,28 @@ async fn handle_connection(
                 }),
             },
 
+            Request::SessionSearchHistory {
+                session_id,
+                pattern,
+                case_insensitive,
+                regex,
+                limit,
+            } => match sm
+                .search_history(
+                    &session_id,
+                    &pattern,
+                    case_insensitive,
+                    regex,
+                    limit as usize,
+                )
+                .await
+            {
+                Ok(results) => Response::SearchHistoryResults(results),
+                Err(e) => Response::Error(HavenError::Internal {
+                    reason: e.to_string(),
+                }),
+            },
+
             // Auth is handled at connection start; if received again, just ack it
             Request::Auth { .. } => Response::AuthOk,
         };
