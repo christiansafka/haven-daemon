@@ -1,8 +1,8 @@
 # haven-daemon
 
-> Source code and issue tracker for the session daemon that [Haven](https://haventerminal.com) runs on your remote machines.
+> Source code and issue tracker for the session daemon **and the `haven` CLI** that [Haven](https://haventerminal.com) runs on your remote machines.
 
-Haven is a terminal app for ML engineers who work on remote GPU machines. When you connect to a host, Haven installs a small daemon (~4MB) that manages persistent terminal sessions over a Unix socket. **This repo is that daemon** -- fully readable, fully auditable.
+Haven is a terminal app for ML engineers who work on remote GPU machines. When you connect to a host, Haven installs a small binary (~4MB) that manages persistent terminal sessions over a Unix socket. **This repo is that binary** — fully readable, fully auditable.
 
 ## What it does
 
@@ -10,6 +10,7 @@ Haven is a terminal app for ML engineers who work on remote GPU machines. When y
 - Multiplexes terminal sessions through a single Unix socket
 - Encrypts session transcripts at rest (ChaCha20-Poly1305)
 - Tracks working directory changes without modifying your shell config
+- Provides a `haven` CLI so you can browse and attach to your sessions from any terminal, not just the Haven app
 
 ## What it does NOT do
 
@@ -31,20 +32,36 @@ Found a bug or unexpected behavior with the daemon on your remote machine? [Open
 cargo build --release -p haven-daemon
 ```
 
-## Usage (CLI)
+## Usage
+
+The repo builds one binary, `haven-session-daemon`, that behaves as two tools depending on the name it's invoked with. The installer creates a `haven` symlink next to it so you can use either entry point:
 
 ```bash
+# Daemon / low-level subcommands
 haven-session-daemon daemon              # Start the daemon
 haven-session-daemon session list        # List sessions
 haven-session-daemon session create      # Create a session
-haven-session-daemon session attach <id> # Attach to a session
+haven-session-daemon session attach <id> # Attach to a session (raw mode, SIGWINCH, chord keys)
 haven-session-daemon session kill <id>   # Kill a session
+
+# haven CLI (terse, interactive — the one you'll actually use)
+haven                    # no args: pick-or-create-or-attach, whichever makes sense
+haven ls                 # list sessions
+haven new [name]         # create a session and attach
+haven attach <target>    # attach by name, 1-based index, or uuid prefix
+haven kill <target>      # kill a session
+haven rename <target> <name>
 ```
+
+While attached, the chord-key prefix is `Ctrl-\` (or `Ctrl-B` for tmux muscle memory). Press `Ctrl-\ d` to detach, `Ctrl-\ s` to switch sessions, `Ctrl-\ n` for a new one, `Ctrl-\ ?` for help. Full docs: <https://haventerminal.com/docs/cli>.
 
 ## Uninstall
 
+The CLI and the daemon are the same binary, and all session state lives in `~/.haven/`. **Removing either one removes everything**, including all running sessions and their encrypted transcripts:
+
 ```bash
 rm -rf ~/.haven/
+rm -f ~/.local/bin/haven  # if you symlinked it into your PATH
 ```
 
 ## Security

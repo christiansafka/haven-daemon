@@ -1,6 +1,8 @@
 mod cli;
+mod cli_haven;
 mod daemon;
 mod history;
+mod picker;
 mod protocol;
 mod pty;
 mod session;
@@ -8,13 +10,63 @@ mod session;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands, SessionAction};
+use haven_client::{
+    connect_daemon, run_attach, send_request, AttachOptions, AttachOutcome,
+};
 use haven_protocol::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use std::path::PathBuf;
+
+/// Decide whether this invocation should dispatch to the `haven` CLI based on
+/// `argv[0]`. Two triggers:
+///   1. The binary was invoked as `haven` (most commonly via a symlink next
+///      to `haven-session-daemon`).
+///   2. The invocation is `haven-session-daemon haven ...` — a convenience
+///      for development so the CLI is reachable without installing a symlink.
+fn should_run_as_haven_cli(args: &[String]) -> bool {
+    if let Some(arg0) = args.first() {
+        let base = std::path::Path::new(arg0)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if base == "haven" {
+            return true;
+        }
+    }
+    matches!(args.get(1).map(String::as_str), Some("haven"))
+}
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+
+    // --- Multicall dispatch: `haven` → cli_haven::run ---
+    if should_run_as_haven_cli(&raw_args) {
+        // Normalize argv so clap sees "haven" as the program name regardless
+        // of how we were invoked.
+        let mut haven_args = vec!["haven".to_string()];
+        if raw_args.first().map(|s| {
+            std::path::Path::new(s)
+                .file_stem()
+                .and_then(|f| f.to_str())
+                .map(|f| f != "haven")
+                .unwrap_or(true)
+        }) == Some(true)
+        {
+            // Invocation was `haven-session-daemon haven ...`; skip raw_args[0]
+            // and raw_args[1] ("haven"), pass the rest.
+            haven_args.extend(raw_args.into_iter().skip(2));
+        } else {
+            // Invocation was `haven ...`; skip just raw_args[0].
+            haven_args.extend(raw_args.into_iter().skip(1));
+        }
+        cli_haven::run(haven_args);
+    }
+
+    // --- Otherwise run as haven-session-daemon ---
     let cli = Cli::parse();
 
+    // Tracing is only initialized for the daemon-facing CLI. The `haven` path
+    // above skips this because tracing writes to stderr and would smash raw
+    // mode during an attach.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -54,92 +106,7 @@ fn main() {
     }
 }
 
-/// Send a request frame and read the response, capturing history Event data.
-/// Returns (Response, Vec<u8>) where the Vec contains any Output event data
-/// that arrived before the Response (i.e., history replay).
-async fn send_request_with_history(stream: &mut UnixStream, correlation_id: u32, req: &Request) -> Result<(Response, Vec<u8>)> {
-    let frame = Frame::request(correlation_id, req)?;
-    let encoded = frame.encode();
-    stream.write_all(&encoded).await?;
-    stream.flush().await?;
-
-    let mut history = Vec::new();
-    loop {
-        let mut len_buf = [0u8; 4];
-        AsyncReadExt::read_exact(stream, &mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut body = vec![0u8; len];
-        AsyncReadExt::read_exact(stream, &mut body).await?;
-        let resp_frame = Frame::decode(&body)?;
-
-        if resp_frame.frame_type == FrameType::Response {
-            let resp: Response = rmp_serde::from_slice(&resp_frame.payload)?;
-            return Ok((resp, history));
-        }
-        // Capture Output events (history replay)
-        if let Ok(event) = rmp_serde::from_slice::<Event>(&resp_frame.payload) {
-            if let Event::Output { data, .. } = event {
-                history.extend_from_slice(&data);
-            }
-        }
-    }
-}
-
-/// Send a request frame and read the response.
-/// Skips any Event frames that arrive before the Response (e.g., history replay).
-async fn send_request(stream: &mut UnixStream, correlation_id: u32, req: &Request) -> Result<Response> {
-    let frame = Frame::request(correlation_id, req)?;
-    let encoded = frame.encode();
-    stream.write_all(&encoded).await?;
-    stream.flush().await?;
-
-    // Read frames until we get a Response (skip Events that may arrive first)
-    loop {
-        let mut len_buf = [0u8; 4];
-        AsyncReadExt::read_exact(stream, &mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut body = vec![0u8; len];
-        AsyncReadExt::read_exact(stream, &mut body).await?;
-        let resp_frame = Frame::decode(&body)?;
-
-        if resp_frame.frame_type == FrameType::Response {
-            let resp: Response = rmp_serde::from_slice(&resp_frame.payload)?;
-            return Ok(resp);
-        }
-        // Skip non-Response frames (Events sent before the Response)
-    }
-}
-
-async fn connect_daemon(socket_path: &std::path::Path) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .map_err(|e| anyhow::anyhow!(
-            "Failed to connect to daemon at {}: {e}\nIs the daemon running? Start with: haven-session-daemon daemon",
-            socket_path.display()
-        ))?;
-
-    // Read auth token and authenticate
-    let token_path = socket_path.with_extension("token");
-    let token = std::fs::read_to_string(&token_path)
-        .map_err(|e| anyhow::anyhow!(
-            "Failed to read auth token at {}: {e}",
-            token_path.display()
-        ))?;
-
-    let auth_req = Request::Auth { token };
-    match send_request(&mut stream, 0, &auth_req).await? {
-        Response::AuthOk => {}
-        Response::Error(e) => return Err(anyhow::anyhow!("Authentication failed: {e}")),
-        _ => return Err(anyhow::anyhow!("Unexpected auth response")),
-    }
-
-    Ok(stream)
-}
-
-async fn handle_cli_action(
-    action: SessionAction,
-    socket_path: &std::path::Path,
-) -> Result<()> {
+async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Result<()> {
     match action {
         SessionAction::Create {
             name, shell, cwd, cols, rows, env, json,
@@ -198,96 +165,25 @@ async fn handle_cli_action(
         SessionAction::Attach { id, history_bytes } => {
             let session_id: uuid::Uuid = id.parse()
                 .map_err(|e| anyhow::anyhow!("Invalid session ID: {e}"))?;
-            let mut stream = connect_daemon(socket_path).await?;
+            let stream = connect_daemon(socket_path).await?;
 
-            // Send attach request — use send_request_with_history to capture
-            // history Event frames that arrive before the Response.
-            let req = Request::SessionAttach { session_id, history_bytes };
-            let history_data = match send_request_with_history(&mut stream, 1, &req).await? {
-                (Response::SessionAttached { .. }, history) => history,
-                (Response::Error(e), _) => return Err(anyhow::anyhow!("Attach failed: {e}")),
-                _ => return Err(anyhow::anyhow!("Unexpected response")),
+            // Delegate to haven-client's real attach loop (raw mode, SIGWINCH,
+            // chord keys — all of it). The daemon CLI gets the same behavior
+            // as the `haven` CLI, not the previous smoke-test implementation.
+            let opts = AttachOptions {
+                history_bytes,
+                print_hint: false,
             };
-
-            // Write history to stdout before entering live stream
-            if !history_data.is_empty() {
-                let mut stdout = tokio::io::stdout();
-                let _ = stdout.write_all(&history_data).await;
-                let _ = stdout.flush().await;
+            match run_attach(stream, session_id, opts).await? {
+                AttachOutcome::Exited(code) => std::process::exit(code),
+                AttachOutcome::Detached => {}
+                AttachOutcome::Switch | AttachOutcome::NewSession => {
+                    // The daemon CLI doesn't know what to do with these
+                    // (it has no picker), so treat them as detach.
+                    eprintln!("\r\n[haven-session-daemon] detached");
+                }
+                AttachOutcome::Disconnected => std::process::exit(1),
             }
-
-            // Now we're attached. The daemon will send Event frames on this socket.
-            // We forward: PTY output → stdout, stdin → SessionWrite requests.
-            let (mut sock_reader, mut sock_writer) = stream.into_split();
-
-            let mut stdout = tokio::io::stdout();
-            let mut stdin = tokio::io::stdin();
-
-            // Task: read Event frames from daemon → write raw output to stdout
-            let reader_task = tokio::spawn(async move {
-                loop {
-                    // Read frame length
-                    let mut len_buf = [0u8; 4];
-                    if AsyncReadExt::read_exact(&mut sock_reader, &mut len_buf).await.is_err() {
-                        break 0i32;
-                    }
-                    let len = u32::from_be_bytes(len_buf) as usize;
-                    let mut body = vec![0u8; len];
-                    if AsyncReadExt::read_exact(&mut sock_reader, &mut body).await.is_err() {
-                        break 0;
-                    }
-                    let frame = match Frame::decode(&body) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-                    let event: Event = match rmp_serde::from_slice(&frame.payload) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-
-                    match event {
-                        Event::Output { data, .. } => {
-                            if stdout.write_all(&data).await.is_err() {
-                                break 0;
-                            }
-                            let _ = stdout.flush().await;
-                        }
-                        Event::SessionExited { exit_code, .. } => {
-                            break exit_code;
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            // Task: read stdin → send SessionWrite frames to daemon
-            let writer_task = tokio::spawn(async move {
-                let mut buf = [0u8; 8192];
-                loop {
-                    let n = match AsyncReadExt::read(&mut stdin, &mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    let req = Request::SessionWrite {
-                        session_id,
-                        data: buf[..n].to_vec(),
-                    };
-                    let frame = match Frame::request(0, &req) {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
-                    let encoded = frame.encode();
-                    if sock_writer.write_all(&encoded).await.is_err() {
-                        break;
-                    }
-                    let _ = sock_writer.flush().await;
-                }
-            });
-
-            // Wait for session exit
-            let exit_code = reader_task.await.unwrap_or(1);
-            writer_task.abort();
-            std::process::exit(exit_code);
         }
 
         SessionAction::Resize { id, cols, rows } => {

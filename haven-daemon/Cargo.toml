@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 haven-protocol = { path = "../haven-protocol" }
+haven-client = { path = "../haven-client" }
+crossterm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
