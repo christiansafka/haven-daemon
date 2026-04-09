@@ -162,7 +162,7 @@ async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Resu
             }
         }
 
-        SessionAction::Attach { id, history_bytes } => {
+        SessionAction::Attach { id, history_bytes, pipe } => {
             let session_id: uuid::Uuid = id.parse()
                 .map_err(|e| anyhow::anyhow!("Invalid session ID: {e}"))?;
             let stream = connect_daemon(socket_path).await?;
@@ -170,9 +170,13 @@ async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Resu
             // Delegate to haven-client's real attach loop (raw mode, SIGWINCH,
             // chord keys — all of it). The daemon CLI gets the same behavior
             // as the `haven` CLI, not the previous smoke-test implementation.
+            //
+            // `--pipe` switches off the TTY-only behaviors so haven-app can
+            // continue driving remote sessions over a non-PTY SSH exec channel.
             let opts = AttachOptions {
                 history_bytes,
                 print_hint: false,
+                pipe_mode: pipe,
             };
             match run_attach(stream, session_id, opts).await? {
                 AttachOutcome::Exited(code) => std::process::exit(code),

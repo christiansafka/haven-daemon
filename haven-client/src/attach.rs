@@ -47,6 +47,18 @@ pub struct AttachOptions {
     /// If true, print the one-line chord-key hint banner before history
     /// replays. Useful for the first attach in a `haven` session.
     pub print_hint: bool,
+    /// Non-interactive "pipe" mode for programmatic drivers (e.g. haven-app
+    /// running this command over an SSH exec channel without a PTY).
+    ///
+    /// In pipe mode we skip all the things that assume our stdin is a real
+    /// TTY: no raw mode, no chord parsing (stdin bytes pass straight through
+    /// as `SessionWrite` payloads), no `SIGWINCH` listener (the driver is
+    /// expected to call `session resize` explicitly), no initial resize
+    /// (`crossterm::terminal::size()` would fail on a non-tty anyway).
+    ///
+    /// The on-the-wire framing to the daemon is unchanged — pipe mode only
+    /// affects what `run_attach` does to the user's terminal.
+    pub pipe_mode: bool,
 }
 
 impl Default for AttachOptions {
@@ -54,6 +66,7 @@ impl Default for AttachOptions {
         Self {
             history_bytes: 1_048_576,
             print_hint: false,
+            pipe_mode: false,
         }
     }
 }
@@ -109,22 +122,32 @@ pub async fn run_attach(
         let _ = stdout.flush();
     }
 
-    // 4. Enter raw mode for the live stream. Restored on every return path
-    //    via the RAII guard.
-    let _raw = RawModeGuard::enable()?;
+    // 4. Enter raw mode for the live stream (interactive mode only). Restored
+    //    on every return path via the RAII guard. In pipe mode our stdin is
+    //    not a TTY, so we skip this entirely — `tcsetattr` would return
+    //    ENXIO and break programmatic callers like haven-app.
+    let _raw = if opts.pipe_mode {
+        None
+    } else {
+        Some(RawModeGuard::enable()?)
+    };
 
     // 5. Send an initial resize so the daemon's PTY matches the user's actual
     //    terminal size (the SessionAttached response carries no size info).
-    if let Ok((cols, rows)) = terminal::size() {
-        let resize = Request::SessionResize {
-            session_id,
-            cols,
-            rows,
-        };
-        if let Ok(frame) = Frame::request(0, &resize) {
-            let encoded = frame.encode();
-            stream.write_all(&encoded).await.ok();
-            stream.flush().await.ok();
+    //    Skipped in pipe mode: `terminal::size()` doesn't work on a non-tty,
+    //    and the driver is responsible for sending its own `session resize`.
+    if !opts.pipe_mode {
+        if let Ok((cols, rows)) = terminal::size() {
+            let resize = Request::SessionResize {
+                session_id,
+                cols,
+                rows,
+            };
+            if let Ok(frame) = Frame::request(0, &resize) {
+                let encoded = frame.encode();
+                stream.write_all(&encoded).await.ok();
+                stream.flush().await.ok();
+            }
         }
     }
 
@@ -238,7 +261,29 @@ pub async fn run_attach(
 
     let frame_tx_c = frame_tx.clone();
     let outcome_tx_c = outcome_tx.clone();
+    let pipe_mode = opts.pipe_mode;
     let stdin_task = tokio::spawn(async move {
+        // Pipe mode: forward stdin chunks straight through as SessionWrite
+        // frames with no chord parsing. This is what programmatic drivers
+        // like haven-app expect — they want to be able to send any byte,
+        // including Ctrl-\, without it being intercepted as a prefix.
+        if pipe_mode {
+            while let Some(chunk) = stdin_rx.recv().await {
+                let req = Request::SessionWrite {
+                    session_id,
+                    data: chunk,
+                };
+                if let Ok(frame) = Frame::request(0, &req) {
+                    if frame_tx_c.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // stdin closed — let the driver-side disconnect drive shutdown.
+            let _ = outcome_tx_c.send(AttachOutcome::Disconnected).await;
+            return;
+        }
+
         let mut parser = ChordParser::new();
         loop {
             let chunk = match tokio::time::timeout(
@@ -322,28 +367,36 @@ pub async fn run_attach(
     });
 
     // --- Task D: SIGWINCH listener → SessionResize frames.
-    let frame_tx_d = frame_tx.clone();
-    let winch_task = tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sig = match signal(SignalKind::window_change()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        while sig.recv().await.is_some() {
-            if let Ok((cols, rows)) = terminal::size() {
-                let req = Request::SessionResize {
-                    session_id,
-                    cols,
-                    rows,
-                };
-                if let Ok(frame) = Frame::request(0, &req) {
-                    if frame_tx_d.send(frame).await.is_err() {
-                        return;
+    //
+    // Pipe mode skips this entirely: there is no real terminal whose size
+    // could change, and the driver (e.g. haven-app) sends explicit `session
+    // resize` calls when its embedded xterm is resized.
+    let winch_task = if opts.pipe_mode {
+        tokio::spawn(async move {})
+    } else {
+        let frame_tx_d = frame_tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while sig.recv().await.is_some() {
+                if let Ok((cols, rows)) = terminal::size() {
+                    let req = Request::SessionResize {
+                        session_id,
+                        cols,
+                        rows,
+                    };
+                    if let Ok(frame) = Frame::request(0, &req) {
+                        if frame_tx_d.send(frame).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
-        }
-    });
+        })
+    };
 
     // Wait for the first outcome from any task.
     let outcome = outcome_rx

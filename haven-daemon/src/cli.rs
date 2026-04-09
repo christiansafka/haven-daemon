@@ -84,6 +84,12 @@ pub enum SessionAction {
         /// Bytes of history to replay
         #[arg(long, default_value_t = 1_048_576)]
         history_bytes: u64,
+
+        /// Non-interactive pipe mode for programmatic drivers (e.g. haven-app
+        /// over an SSH exec channel without a PTY). Disables raw mode, chord
+        /// keys, and SIGWINCH handling; stdin bytes pass straight through.
+        #[arg(long)]
+        pipe: bool,
     },
 
     /// Resize a session's PTY
