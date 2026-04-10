@@ -103,10 +103,13 @@ pub fn run(args: Vec<String>) -> ! {
 
 async fn run_async(args: Vec<String>) -> Result<i32> {
     let cli = HavenCli::parse_from(args);
-    let socket_path = cli
-        .socket
-        .clone()
-        .unwrap_or_else(haven_protocol::default_socket_path);
+    // Resolve socket: explicit --socket wins, otherwise discover any existing
+    // daemon (unversioned `daemon.sock` first, then highest versioned), and
+    // finally fall back to the unversioned default so autostart has a path
+    // to spawn against.
+    let socket_path = cli.socket.clone().unwrap_or_else(|| {
+        haven_protocol::discover_socket_path().unwrap_or_else(haven_protocol::default_socket_path)
+    });
 
     // Auto-spawn the daemon if needed. The current exe is the multicall
     // binary, so we pass it as the daemon binary hint — when the user
@@ -168,10 +171,53 @@ async fn cmd_ls(socket_path: &Path, json: bool) -> Result<i32> {
     }
     if sessions.is_empty() {
         println!("No sessions. Run `haven new` to create one.");
-        return Ok(0);
+    } else {
+        print_session_table(&sessions);
     }
-    print_session_table(&sessions);
+    print_other_daemons_hint(socket_path).await;
     Ok(0)
+}
+
+/// If there are other daemon sockets in `~/.haven/` (e.g. from a different
+/// Haven version that the app spun up), probe them and tell the user how to
+/// reach them. Stale (unresponsive) sockets are silently ignored.
+async fn print_other_daemons_hint(active: &Path) {
+    let active_canon = std::fs::canonicalize(active).unwrap_or_else(|_| active.to_path_buf());
+    let mut others: Vec<PathBuf> = haven_protocol::list_daemon_sockets()
+        .into_iter()
+        .filter(|p| {
+            std::fs::canonicalize(p)
+                .map(|c| c != active_canon)
+                .unwrap_or(true)
+        })
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+    others.sort();
+
+    let mut live = Vec::new();
+    for p in others {
+        // Just open the socket — if a daemon is listening it'll accept the
+        // connection. We don't auth or query: this stays under a few ms even
+        // with several candidates.
+        if tokio::net::UnixStream::connect(&p).await.is_ok() {
+            live.push(p);
+        }
+    }
+    if live.is_empty() {
+        return;
+    }
+
+    eprintln!();
+    eprintln!(
+        "Note: {} other daemon{} also listening (likely a different Haven version):",
+        live.len(),
+        if live.len() == 1 { "" } else { "s" }
+    );
+    for p in live {
+        eprintln!("  haven --socket {} ls", p.display());
+    }
 }
 
 async fn cmd_attach(socket_path: &Path, target: String) -> Result<i32> {

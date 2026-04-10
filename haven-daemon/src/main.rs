@@ -82,12 +82,20 @@ fn main() {
         .unwrap_or_else(|| haven_protocol::default_socket_path());
 
     match cli.command {
-        Commands::Daemon { foreground: _ } => {
-            tracing::info!("Haven session daemon v{}", env!("CARGO_PKG_VERSION"));
+        Commands::Daemon {
+            foreground: _,
+            watch_parent,
+        } => {
+            tracing::info!(
+                "Haven session daemon v{} (watch_parent={:?})",
+                env!("CARGO_PKG_VERSION"),
+                watch_parent
+            );
 
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(async {
-                let mut daemon = daemon::Daemon::new(socket_path, data_dir);
+                let mut daemon =
+                    daemon::Daemon::with_parent_watch(socket_path, data_dir, watch_parent);
                 if let Err(e) = daemon.run().await {
                     tracing::error!("Daemon error: {e}");
                     std::process::exit(1);

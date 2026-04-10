@@ -26,6 +26,77 @@ pub fn default_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".haven")
 }
 
+/// Discover an existing daemon socket in `~/.haven/`.
+///
+/// Order of preference:
+///   1. The unversioned `daemon.sock` (a user-spawned local daemon — wins if
+///      present, since the user explicitly chose it).
+///   2. The highest-version `daemon-{version}.sock` present in the directory.
+///      Versions are compared as dotted integer tuples, so `0.1.10` > `0.1.9`.
+///
+/// Returns `None` if no candidate sockets exist. Callers should fall back to
+/// `default_socket_path()` so autostart and error messages use a known path.
+///
+/// Note: this only checks for the *existence* of the socket file, not whether
+/// a daemon is actually listening on it. Stale socket files are possible if a
+/// daemon was killed without cleanup; the connect attempt will surface that.
+pub fn discover_socket_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = std::path::PathBuf::from(home).join(".haven");
+
+    let unversioned = dir.join("daemon.sock");
+    if unversioned.exists() {
+        return Some(unversioned);
+    }
+
+    let mut candidates: Vec<(Vec<u32>, std::path::PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Strict match: "daemon-<version>.sock" where <version> is dot-separated digits.
+        let Some(version_str) = name
+            .strip_prefix("daemon-")
+            .and_then(|s| s.strip_suffix(".sock"))
+        else {
+            continue;
+        };
+        let parts: Option<Vec<u32>> = version_str.split('.').map(|s| s.parse().ok()).collect();
+        if let Some(parts) = parts {
+            if !parts.is_empty() {
+                candidates.push((parts, path));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().next().map(|(_, p)| p)
+}
+
+/// List every daemon socket file in `~/.haven/` (unversioned + all versioned).
+/// Used by the CLI to warn about sessions on other daemon versions.
+pub fn list_daemon_sockets() -> Vec<std::path::PathBuf> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    let dir = std::path::PathBuf::from(home).join(".haven");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let is_match = name == "daemon.sock"
+                || (name.starts_with("daemon-") && name.ends_with(".sock"));
+            if is_match {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 /// Wire protocol frame types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

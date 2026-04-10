@@ -27,6 +27,13 @@ pub enum Commands {
         /// Run in foreground (don't daemonize)
         #[arg(long, default_value_t = true)]
         foreground: bool,
+
+        /// Watch a parent PID. When that PID disappears, the daemon kills
+        /// every session and exits — used by haven-app to make local sessions
+        /// die with the app on crash/quit. Omit for a fully detached daemon
+        /// (the default for `haven-session-daemon daemon` from a shell).
+        #[arg(long)]
+        watch_parent: Option<u32>,
     },
 
     /// Manage sessions

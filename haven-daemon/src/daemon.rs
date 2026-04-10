@@ -3,13 +3,44 @@ use haven_protocol::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
 use crate::session::SessionManager;
+
+/// Shared state for the parent-watch task. Mutated by the `SetParentWatch`
+/// request handler and read by the polling task.
+///
+/// `pid` is the process the daemon is currently watching. When `None`, the
+/// watcher is paused — typically because the app announced it's about to
+/// restart for an update. `grace_until` bounds how long that paused state
+/// is honored: once it expires the daemon falls back to its previously
+/// known PID, which (if the updater silently died) will trip the
+/// "parent gone" path on the next tick and cleanly tear everything down.
+#[derive(Debug, Clone)]
+pub struct ParentWatchState {
+    pub pid: Option<u32>,
+    pub last_known_pid: Option<u32>,
+    pub grace_until: Option<Instant>,
+}
+
+impl ParentWatchState {
+    fn new(initial: Option<u32>) -> Self {
+        Self {
+            pid: initial,
+            last_known_pid: initial,
+            grace_until: None,
+        }
+    }
+}
+
+/// How often the parent-watch task probes the parent PID. 2 seconds is the
+/// sweet spot between "instant cleanup" and "free polling cost" — a single
+/// `kill(pid, 0)` syscall every 2s is essentially zero overhead.
+const PARENT_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The daemon server.
 pub struct Daemon {
@@ -17,15 +48,28 @@ pub struct Daemon {
     socket_path: PathBuf,
     token: String,
     start_time: Instant,
+    parent_watch: Arc<Mutex<ParentWatchState>>,
 }
 
 impl Daemon {
     pub fn new(socket_path: PathBuf, data_dir: PathBuf) -> Self {
+        Self::with_parent_watch(socket_path, data_dir, None)
+    }
+
+    /// Construct the daemon with an initial parent-watch PID. When `Some`,
+    /// the daemon will spawn a background task that polls that PID and
+    /// shuts down (killing every session) when it disappears.
+    pub fn with_parent_watch(
+        socket_path: PathBuf,
+        data_dir: PathBuf,
+        watch_parent: Option<u32>,
+    ) -> Self {
         Daemon {
             session_manager: Arc::new(SessionManager::new(data_dir)),
             socket_path,
             token: String::new(),
             start_time: Instant::now(),
+            parent_watch: Arc::new(Mutex::new(ParentWatchState::new(watch_parent))),
         }
     }
 
@@ -82,6 +126,12 @@ impl Daemon {
 
         tracing::info!("Daemon listening on {}", self.socket_path.display());
 
+        // Spawn the parent-watch task. It runs unconditionally — even when
+        // no PID is set yet, the app may install one later via
+        // `SetParentWatch`. The task is cheap when idle (one mutex lock and
+        // a sleep per tick).
+        spawn_parent_watch_task(self.parent_watch.clone(), self.session_manager.clone());
+
         let token = Arc::new(self.token.clone());
 
         loop {
@@ -90,8 +140,11 @@ impl Daemon {
                     let sm = self.session_manager.clone();
                     let start_time = self.start_time;
                     let token = token.clone();
+                    let watch = self.parent_watch.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, sm, start_time, &token).await {
+                        if let Err(e) =
+                            handle_connection(stream, sm, start_time, &token, watch).await
+                        {
                             tracing::debug!("Connection ended: {e}");
                         }
                     });
@@ -102,6 +155,71 @@ impl Daemon {
             }
         }
     }
+}
+
+/// Background task: every `PARENT_WATCH_INTERVAL`, check whether the watched
+/// PID is still alive. On disappearance, kill all sessions and exit. Honors
+/// the grace window so an in-progress auto-update doesn't trip the watch.
+fn spawn_parent_watch_task(
+    state: Arc<Mutex<ParentWatchState>>,
+    sm: Arc<SessionManager>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(PARENT_WATCH_INTERVAL).await;
+
+            let pid_to_check = {
+                let mut s = state.lock().await;
+                // Grace expiry: if we paused for an update and the new app
+                // never showed up, fall back to the last known PID. The
+                // next poll iteration will find that PID gone and trigger
+                // the shutdown path — exactly what we want.
+                if let Some(deadline) = s.grace_until {
+                    if Instant::now() >= deadline {
+                        s.grace_until = None;
+                        if s.pid.is_none() {
+                            s.pid = s.last_known_pid;
+                            tracing::info!(
+                                "parent-watch: grace expired, resuming watch on pid {:?}",
+                                s.pid
+                            );
+                        }
+                    }
+                }
+                s.pid
+            };
+
+            let Some(pid) = pid_to_check else {
+                // Watching is disabled. Loop and re-check next tick — the
+                // app may install a PID via SetParentWatch.
+                continue;
+            };
+
+            if !pid_alive(pid) {
+                tracing::warn!(
+                    "parent-watch: parent pid {} is gone, shutting down daemon",
+                    pid
+                );
+                sm.kill_all().await;
+                // Give the OS a moment to actually deliver SIGTERM to the
+                // PTY children before we yank the daemon.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+/// Returns true if the given PID exists. Uses `kill(pid, 0)`:
+///   * 0 → process exists and we have permission to signal it
+///   * EPERM → process exists but we lack permission (still alive!)
+///   * ESRCH → no such process
+fn pid_alive(pid: u32) -> bool {
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if r == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Read a frame from the stream. Returns None on clean disconnect.
@@ -139,6 +257,7 @@ async fn handle_connection(
     sm: Arc<SessionManager>,
     start_time: Instant,
     expected_token: &str,
+    parent_watch: Arc<Mutex<ParentWatchState>>,
 ) -> Result<()> {
     tracing::debug!("New client connection");
 
@@ -419,6 +538,22 @@ async fn handle_connection(
 
             // Auth is handled at connection start; if received again, just ack it
             Request::Auth { .. } => Response::AuthOk,
+
+            Request::SetParentWatch { pid, grace_secs } => {
+                let mut s = parent_watch.lock().await;
+                s.pid = pid;
+                if let Some(p) = pid {
+                    s.last_known_pid = Some(p);
+                }
+                s.grace_until = grace_secs.map(|g| Instant::now() + Duration::from_secs(g));
+                tracing::info!(
+                    "SetParentWatch: pid={:?} grace_secs={:?} last_known={:?}",
+                    s.pid,
+                    grace_secs,
+                    s.last_known_pid
+                );
+                Response::ParentWatchUpdated { watching: s.pid }
+            }
         };
 
         let resp_frame = Frame::response(correlation_id, &response)?;

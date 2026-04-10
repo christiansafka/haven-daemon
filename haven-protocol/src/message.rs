@@ -72,6 +72,18 @@ pub enum Request {
 
     /// Authenticate with the daemon (must be first frame on connection).
     Auth { token: String },
+
+    /// Tell the daemon which parent process to watch. When `pid` is `Some`,
+    /// the daemon polls that PID and shuts down (killing all sessions) when
+    /// it disappears. When `pid` is `None`, parent-watching is disabled —
+    /// useful as a "the app is about to restart for an update, please don't
+    /// die" signal. `grace_secs`, if set, bounds how long the paused state
+    /// is honored before the daemon falls back to its previous watch (so a
+    /// crashed updater can't leave the daemon orphaned forever).
+    SetParentWatch {
+        pid: Option<u32>,
+        grace_secs: Option<u64>,
+    },
 }
 
 /// A response from the daemon to the app.
@@ -128,6 +140,11 @@ pub enum Response {
 
     /// Authentication succeeded.
     AuthOk,
+
+    /// `SetParentWatch` was applied. `watching` reflects the new active
+    /// state: `Some(pid)` if the daemon is now watching a parent, `None` if
+    /// watching is currently paused (grace period or disabled outright).
+    ParentWatchUpdated { watching: Option<u32> },
 
     /// An error occurred.
     Error(HavenError),

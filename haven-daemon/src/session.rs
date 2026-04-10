@@ -241,5 +241,28 @@ impl SessionManager {
     pub async fn count(&self) -> usize {
         self.sessions.read().await.len()
     }
+
+    /// Kill every session, draining the registry. Used by the parent-watch
+    /// shutdown path so PTY children don't outlive the daemon (and the app
+    /// that asked for them). Best-effort: failures are logged and ignored —
+    /// we still want the rest of the cleanup to run before the daemon exits.
+    pub async fn kill_all(&self) {
+        let sessions: Vec<_> = {
+            let mut guard = self.sessions.write().await;
+            guard.drain().collect()
+        };
+        let n = sessions.len();
+        for (id, session) in sessions {
+            let mut sess = session.lock().await;
+            if let Err(e) = sess.pty.kill() {
+                tracing::warn!("kill_all: failed to kill session {id}: {e}");
+            }
+            sess.info.status = SessionStatus::Exited;
+            if let Some(task) = sess.transcript_task.take() {
+                task.abort();
+            }
+        }
+        tracing::info!("kill_all: drained {n} sessions");
+    }
 }
 
