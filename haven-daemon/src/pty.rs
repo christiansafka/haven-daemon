@@ -85,6 +85,49 @@ impl PtyHandle {
             cmd.env("PATH", path_parts.join(":"));
         }
 
+        // Set up a clean, minimal prompt for local sessions. Each shell
+        // family needs a different mechanism because login shells source
+        // rc files that override env-var-based prompts.
+        if let Ok(home) = std::env::var("HOME") {
+            let haven_tmp = std::env::temp_dir().join(format!("haven-shell-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&haven_tmp);
+
+            if shell.ends_with("zsh") && !env.contains_key("ZDOTDIR") {
+                // zsh: ZDOTDIR trick — wrapper .zshrc sources the real one,
+                // then overrides PROMPT to show just the directory basename.
+                let wrapper = format!(
+                    "ZDOTDIR=\"{home}\"\n\
+                     [[ -f \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
+                     [[ -f \"$ZDOTDIR/.zshrc\" ]] && source \"$ZDOTDIR/.zshrc\"\n\
+                     PROMPT='%1~ %# '\n"
+                );
+                let _ = std::fs::write(haven_tmp.join(".zshrc"), wrapper);
+                let _ = std::fs::write(haven_tmp.join(".zshenv"), format!("ZDOTDIR=\"{home}\"\n"));
+                cmd.env("ZDOTDIR", haven_tmp.to_string_lossy().as_ref());
+            } else if shell.ends_with("bash") && !env.contains_key("PROMPT_COMMAND") {
+                // bash: PROMPT_COMMAND runs after .bashrc/.bash_profile,
+                // so it reliably overrides whatever PS1 they set.
+                cmd.env("PROMPT_COMMAND", r"PS1='\W \$ '");
+            } else if shell.ends_with("fish") && !env.contains_key("XDG_CONFIG_HOME") {
+                // fish: XDG_CONFIG_HOME trick — wrapper config.fish sources
+                // the real one, then overrides fish_prompt.
+                let fish_dir = haven_tmp.join("fish");
+                let _ = std::fs::create_dir_all(&fish_dir);
+                let real_config = format!("{home}/.config/fish/config.fish");
+                let wrapper = format!(
+                    "set -gx XDG_CONFIG_HOME \"{home}/.config\"\n\
+                     if test -f \"{real_config}\"\n\
+                       source \"{real_config}\"\n\
+                     end\n\
+                     function fish_prompt\n\
+                       echo (basename $PWD)' > '\n\
+                     end\n"
+                );
+                let _ = std::fs::write(fish_dir.join("config.fish"), wrapper);
+                cmd.env("XDG_CONFIG_HOME", haven_tmp.to_string_lossy().as_ref());
+            }
+        }
+
         // User-provided env vars override the defaults above
         for (key, value) in env {
             cmd.env(key, value);
