@@ -30,22 +30,34 @@ pub fn default_data_dir() -> std::path::PathBuf {
 ///
 /// Order of preference:
 ///   1. The unversioned `daemon.sock` (a user-spawned local daemon — wins if
-///      present, since the user explicitly chose it).
-///   2. The highest-version `daemon-{version}.sock` present in the directory.
+///      present AND a daemon is listening on it).
+///   2. The highest-version `daemon-{version}.sock` with a listening daemon.
 ///      Versions are compared as dotted integer tuples, so `0.1.10` > `0.1.9`.
+///   3. As a last resort, the highest-version socket file that exists, even
+///      if nothing is currently listening — gives error messages a real path
+///      and lets autostart retry.
+///
+/// Stale socket files (a crashed daemon, or a different-version daemon that
+/// exited) are skipped: we do a non-blocking connect probe to confirm a live
+/// listener before choosing a socket.
 ///
 /// Returns `None` if no candidate sockets exist. Callers should fall back to
 /// `default_socket_path()` so autostart and error messages use a known path.
-///
-/// Note: this only checks for the *existence* of the socket file, not whether
-/// a daemon is actually listening on it. Stale socket files are possible if a
-/// daemon was killed without cleanup; the connect attempt will surface that.
 pub fn discover_socket_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let dir = std::path::PathBuf::from(home).join(".haven");
+    discover_socket_path_in(&std::path::PathBuf::from(home).join(".haven"))
+}
+
+/// Same as `discover_socket_path` but searches an explicit data directory.
+/// Lets the CLI (which may be installed under `~/.haven-dev/`) find its own
+/// variant's sockets instead of defaulting to `~/.haven/`.
+pub fn discover_socket_path_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let is_live = |p: &std::path::Path| -> bool {
+        std::os::unix::net::UnixStream::connect(p).is_ok()
+    };
 
     let unversioned = dir.join("daemon.sock");
-    if unversioned.exists() {
+    if unversioned.exists() && is_live(&unversioned) {
         return Some(unversioned);
     }
 
@@ -70,7 +82,19 @@ pub fn discover_socket_path() -> Option<std::path::PathBuf> {
         }
     }
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    candidates.into_iter().next().map(|(_, p)| p)
+
+    // Prefer the highest-version socket with a live listener.
+    if let Some((_, path)) = candidates.iter().find(|(_, p)| is_live(p)) {
+        return Some(path.clone());
+    }
+
+    // Nothing is listening anywhere. Return the highest-version socket file
+    // if one exists, else the stale unversioned path, else None.
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, p)| p)
+        .or_else(|| unversioned.exists().then_some(unversioned))
 }
 
 /// List every daemon socket file in `~/.haven/` (unversioned + all versioned).
@@ -79,8 +103,12 @@ pub fn list_daemon_sockets() -> Vec<std::path::PathBuf> {
     let Ok(home) = std::env::var("HOME") else {
         return Vec::new();
     };
-    let dir = std::path::PathBuf::from(home).join(".haven");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    list_daemon_sockets_in(&std::path::PathBuf::from(home).join(".haven"))
+}
+
+/// Same as `list_daemon_sockets` but searches an explicit data directory.
+pub fn list_daemon_sockets_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();

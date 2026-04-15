@@ -12,7 +12,7 @@ use haven_client::{
     connect_daemon, ensure_daemon_running, run_attach, send_request, AttachOptions,
     AttachOutcome,
 };
-use haven_protocol::{Request, Response, SessionCreate, SessionId, SessionInfo, SessionStatus};
+use haven_protocol::{Request, Response, SessionId, SessionInfo, SessionStatus};
 use std::path::{Path, PathBuf};
 
 use crate::picker::{self, PickerResult};
@@ -40,18 +40,6 @@ enum HavenCommand {
         /// Output as JSON (for scripting)
         #[arg(long)]
         json: bool,
-    },
-
-    /// Create a new session and attach to it
-    New {
-        /// Session name (optional)
-        name: Option<String>,
-        /// Shell to use (defaults to $SHELL)
-        #[arg(long)]
-        shell: Option<String>,
-        /// Working directory
-        #[arg(long)]
-        cwd: Option<PathBuf>,
     },
 
     /// Attach to a session by id (prefix), name, or index from `haven ls`
@@ -101,14 +89,41 @@ pub fn run(args: Vec<String>) -> ! {
     std::process::exit(exit);
 }
 
+/// The session id of the PTY the CLI is running inside, if any. Set by the
+/// daemon via `HAVEN_SESSION_ID` when spawning a session shell. Used to hide
+/// self-attach paths in the picker and reject `haven attach <self>`.
+fn current_session_id() -> Option<SessionId> {
+    std::env::var("HAVEN_SESSION_ID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// The data directory the CLI should look in. If the `haven` binary is
+/// installed under a `.haven-dev` tree (Haven Dev build), target that dir so
+/// dev and prod can coexist on the same VM without stepping on each other.
+/// Otherwise default to `~/.haven/`.
+fn cli_data_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home_path = PathBuf::from(&home);
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.components().any(|c| c.as_os_str() == ".haven-dev") {
+            return home_path.join(".haven-dev");
+        }
+    }
+    home_path.join(".haven")
+}
+
 async fn run_async(args: Vec<String>) -> Result<i32> {
     let cli = HavenCli::parse_from(args);
     // Resolve socket: explicit --socket wins, otherwise discover any existing
-    // daemon (unversioned `daemon.sock` first, then highest versioned), and
-    // finally fall back to the unversioned default so autostart has a path
+    // daemon in the CLI's data dir (prefers the unversioned `daemon.sock`,
+    // falls back to the highest-version versioned socket with a live
+    // listener), and finally the unversioned default so autostart has a path
     // to spawn against.
+    let data_dir = cli_data_dir();
+    let default_socket = data_dir.join("daemon.sock");
     let socket_path = cli.socket.clone().unwrap_or_else(|| {
-        haven_protocol::discover_socket_path().unwrap_or_else(haven_protocol::default_socket_path)
+        haven_protocol::discover_socket_path_in(&data_dir).unwrap_or_else(|| default_socket.clone())
     });
 
     // Auto-spawn the daemon if needed. The current exe is the multicall
@@ -126,10 +141,6 @@ async fn run_async(args: Vec<String>) -> Result<i32> {
     match cli.command {
         None => interactive_default(&socket_path).await,
         Some(HavenCommand::Ls { json }) => cmd_ls(&socket_path, json).await,
-        Some(HavenCommand::New { name, shell, cwd }) => {
-            let info = create_session(&socket_path, name, shell, cwd).await?;
-            attach_loop(&socket_path, info.id, true).await
-        }
         Some(HavenCommand::Attach { target }) => cmd_attach(&socket_path, target).await,
         Some(HavenCommand::Kill { target }) => cmd_kill(&socket_path, target).await,
         Some(HavenCommand::Rename { target, name }) => {
@@ -143,13 +154,21 @@ async fn run_async(args: Vec<String>) -> Result<i32> {
 // ---------------------------------------------------------------------------
 
 async fn interactive_default(socket_path: &Path) -> Result<i32> {
-    let sessions = list_sessions(socket_path).await?;
+    let all = list_sessions(socket_path).await?;
+    // Hide the session we're running inside: attaching to it would be a
+    // terminal-inside-terminal loop.
+    let self_id = current_session_id();
+    let sessions: Vec<SessionInfo> = all
+        .into_iter()
+        .filter(|s| Some(s.id) != self_id)
+        .collect();
 
     match sessions.len() {
         0 => {
-            eprintln!("[haven] no sessions yet — creating one");
-            let info = create_session(socket_path, None, None, None).await?;
-            attach_loop(socket_path, info.id, true).await
+            eprintln!(
+                "[haven] no sessions available — create one from the Haven app first"
+            );
+            Ok(0)
         }
         1 => {
             let id = sessions[0].id;
@@ -183,7 +202,7 @@ async fn cmd_ls(socket_path: &Path, json: bool) -> Result<i32> {
 /// reach them. Stale (unresponsive) sockets are silently ignored.
 async fn print_other_daemons_hint(active: &Path) {
     let active_canon = std::fs::canonicalize(active).unwrap_or_else(|_| active.to_path_buf());
-    let mut others: Vec<PathBuf> = haven_protocol::list_daemon_sockets()
+    let mut others: Vec<PathBuf> = haven_protocol::list_daemon_sockets_in(&cli_data_dir())
         .into_iter()
         .filter(|p| {
             std::fs::canonicalize(p)
@@ -223,6 +242,9 @@ async fn print_other_daemons_hint(active: &Path) {
 async fn cmd_attach(socket_path: &Path, target: String) -> Result<i32> {
     let sessions = list_sessions(socket_path).await?;
     let id = resolve_target(&sessions, &target)?;
+    if Some(id) == current_session_id() {
+        bail!("refusing to attach to the session you're currently inside");
+    }
     attach_loop(socket_path, id, true).await
 }
 
@@ -297,24 +319,31 @@ async fn attach_loop(socket_path: &Path, mut id: SessionId, print_hint: bool) ->
                 return Ok(1);
             }
             AttachOutcome::Switch => {
-                let sessions = list_sessions(socket_path).await?;
+                let all = list_sessions(socket_path).await?;
+                let self_id = current_session_id();
+                let sessions: Vec<SessionInfo> = all
+                    .into_iter()
+                    .filter(|s| Some(s.id) != self_id)
+                    .collect();
                 match picker::pick(&sessions)? {
                     PickerResult::Attach(idx) => {
                         id = sessions[idx].id;
                         continue;
                     }
                     PickerResult::New => {
-                        let info = create_session(socket_path, None, None, None).await?;
-                        id = info.id;
-                        continue;
+                        eprintln!(
+                            "\r\n[haven] create sessions from the Haven app — the CLI can only attach"
+                        );
+                        return Ok(0);
                     }
                     PickerResult::Quit => return Ok(0),
                 }
             }
             AttachOutcome::NewSession => {
-                let info = create_session(socket_path, None, None, None).await?;
-                id = info.id;
-                continue;
+                eprintln!(
+                    "\r\n[haven] create sessions from the Haven app — the CLI can only attach"
+                );
+                return Ok(0);
             }
         }
     }
@@ -327,8 +356,10 @@ async fn picker_loop(socket_path: &Path, sessions: Vec<SessionInfo>) -> Result<i
             attach_loop(socket_path, id, true).await
         }
         PickerResult::New => {
-            let info = create_session(socket_path, None, None, None).await?;
-            attach_loop(socket_path, info.id, true).await
+            eprintln!(
+                "[haven] create sessions from the Haven app — the CLI can only attach"
+            );
+            Ok(0)
         }
         PickerResult::Quit => Ok(0),
     }
@@ -344,33 +375,6 @@ async fn list_sessions(socket_path: &Path) -> Result<Vec<SessionInfo>> {
         Response::SessionList { sessions } => Ok(sessions),
         Response::Error(e) => Err(anyhow!("{e}")),
         _ => Err(anyhow!("unexpected response to SessionList")),
-    }
-}
-
-async fn create_session(
-    socket_path: &Path,
-    name: Option<String>,
-    shell: Option<String>,
-    cwd: Option<PathBuf>,
-) -> Result<SessionInfo> {
-    // Use the current terminal's size so the initial PTY is already the
-    // right shape. run_attach will send another resize on attach, but this
-    // avoids a momentary 80x24 flash on programs that react to resize
-    // events.
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut stream = connect_daemon(socket_path).await?;
-    let req = Request::SessionCreate(SessionCreate {
-        name,
-        shell,
-        cwd,
-        cols,
-        rows,
-        ..Default::default()
-    });
-    match send_request(&mut stream, 1, &req).await? {
-        Response::SessionCreated(info) => Ok(info),
-        Response::Error(e) => Err(anyhow!("{e}")),
-        _ => Err(anyhow!("unexpected response to SessionCreate")),
     }
 }
 

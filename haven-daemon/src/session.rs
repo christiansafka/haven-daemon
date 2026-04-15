@@ -55,7 +55,7 @@ impl SessionManager {
         });
 
         // Spawn PTY
-        let pty = PtyHandle::spawn(&shell, cwd.as_ref(), &params.env, params.cols, params.rows)
+        let pty = PtyHandle::spawn(&shell, cwd.as_ref(), &params.env, params.cols, params.rows, &id.to_string())
             .context("Failed to spawn PTY")?;
 
         let pid = pty.pid();

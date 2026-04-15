@@ -34,6 +34,7 @@ impl PtyHandle {
         env: &HashMap<String, String>,
         cols: u16,
         rows: u16,
+        session_id: &str,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
 
@@ -70,12 +71,27 @@ impl PtyHandle {
         if let Ok(user) = std::env::var("USER") {
             cmd.env("USER", user);
         }
+        // Tag the shell with its session id so tools running inside (like the
+        // `haven` CLI) can detect they'd be attaching to their own session.
+        cmd.env("HAVEN_SESSION_ID", session_id);
         // Build PATH: prepend common user-local bin dirs so tools like
         // `claude` installed via pipx/npm/etc. are available in spawned shells.
+        // We also prepend this daemon's own directory so the `haven` multicall
+        // symlink sitting next to it resolves first — critical when the prod
+        // and dev variants are both installed (prod at `~/.haven/bin`, dev at
+        // `~/.haven-dev/bin`): each variant's session shell must pick up its
+        // *own* `haven` so the CLI talks to the matching daemon's socket/token.
+        let daemon_bin = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.display().to_string()));
         {
             let home = std::env::var("HOME").unwrap_or_default();
             let mut path_parts: Vec<String> = Vec::new();
+            if let Some(bin) = &daemon_bin {
+                path_parts.push(bin.clone());
+            }
             if !home.is_empty() {
+                path_parts.push(format!("{}/.haven/bin", home));
                 path_parts.push(format!("{}/.local/bin", home));
                 path_parts.push(format!("{}/bin", home));
             }
@@ -85,6 +101,19 @@ impl PtyHandle {
             cmd.env("PATH", path_parts.join(":"));
         }
 
+        // The PATH we set above is clobbered the moment a login shell sources
+        // the user's rc files (many installers inject `export PATH=...:$PATH`
+        // lines). To make sure *this* daemon's matching `haven` CLI wins —
+        // even when prod and dev installers have both touched the user's rc —
+        // we re-assert the daemon's bin dir at the head of PATH *after* rc
+        // files run, via each shell's post-rc hook. Idempotent: no-op if
+        // already first.
+        let path_reassert_sh = daemon_bin.as_ref().map(|bin| {
+            format!(
+                "[ \"${{PATH%%:*}}\" = \"{bin}\" ] || export PATH=\"{bin}:$PATH\""
+            )
+        });
+
         // Set up a clean, minimal prompt for local sessions. Each shell
         // family needs a different mechanism because login shells source
         // rc files that override env-var-based prompts.
@@ -92,28 +121,46 @@ impl PtyHandle {
             let haven_tmp = std::env::temp_dir().join(format!("haven-shell-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&haven_tmp);
 
+            let path_line = path_reassert_sh.as_deref().unwrap_or("");
+
             if shell.ends_with("zsh") && !env.contains_key("ZDOTDIR") {
                 // zsh: ZDOTDIR trick — wrapper .zshrc sources the real one,
-                // then overrides PROMPT to show just the directory basename.
+                // then overrides PROMPT to show just the directory basename
+                // and re-asserts our bin dir at the head of PATH (rc files
+                // often prepend installer paths that'd otherwise shadow our
+                // `haven` multicall symlink).
                 let wrapper = format!(
                     "ZDOTDIR=\"{home}\"\n\
                      [[ -f \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
                      [[ -f \"$ZDOTDIR/.zshrc\" ]] && source \"$ZDOTDIR/.zshrc\"\n\
-                     PROMPT='%1~ %# '\n"
+                     PROMPT='%1~ %# '\n\
+                     {path_line}\n"
                 );
                 let _ = std::fs::write(haven_tmp.join(".zshrc"), wrapper);
                 let _ = std::fs::write(haven_tmp.join(".zshenv"), format!("ZDOTDIR=\"{home}\"\n"));
                 cmd.env("ZDOTDIR", haven_tmp.to_string_lossy().as_ref());
             } else if shell.ends_with("bash") && !env.contains_key("PROMPT_COMMAND") {
-                // bash: PROMPT_COMMAND runs after .bashrc/.bash_profile,
-                // so it reliably overrides whatever PS1 they set.
-                cmd.env("PROMPT_COMMAND", r"PS1='\W \$ '");
+                // bash: PROMPT_COMMAND runs after .bashrc/.bash_profile, so
+                // it reliably overrides whatever PS1 they set. We also use it
+                // to idempotently re-assert our bin dir at the head of PATH.
+                cmd.env(
+                    "PROMPT_COMMAND",
+                    format!("{path_line}; PS1='\\W \\$ '"),
+                );
             } else if shell.ends_with("fish") && !env.contains_key("XDG_CONFIG_HOME") {
                 // fish: XDG_CONFIG_HOME trick — wrapper config.fish sources
                 // the real one, then overrides fish_prompt.
                 let fish_dir = haven_tmp.join("fish");
                 let _ = std::fs::create_dir_all(&fish_dir);
                 let real_config = format!("{home}/.config/fish/config.fish");
+                let fish_path_line = daemon_bin
+                    .as_ref()
+                    .map(|bin| {
+                        format!(
+                            "if test \"$PATH[1]\" != \"{bin}\"; set -gx PATH \"{bin}\" $PATH; end"
+                        )
+                    })
+                    .unwrap_or_default();
                 let wrapper = format!(
                     "set -gx XDG_CONFIG_HOME \"{home}/.config\"\n\
                      if test -f \"{real_config}\"\n\
@@ -121,7 +168,8 @@ impl PtyHandle {
                      end\n\
                      function fish_prompt\n\
                        echo (basename $PWD)' > '\n\
-                     end\n"
+                     end\n\
+                     {fish_path_line}\n"
                 );
                 let _ = std::fs::write(fish_dir.join("config.fish"), wrapper);
                 cmd.env("XDG_CONFIG_HOME", haven_tmp.to_string_lossy().as_ref());
