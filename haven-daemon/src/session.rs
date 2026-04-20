@@ -40,14 +40,16 @@ impl SessionManager {
     pub async fn create(&self, params: SessionCreate) -> Result<SessionInfo> {
         let id = Uuid::new_v4();
         let shell = params.shell.unwrap_or_else(|| self.default_shell.clone());
-        let name = params.name.unwrap_or_else(|| {
-            let count = {
-                // Use a simple counter based on existing sessions
-                // We can't await inside this closure easily, so use a default
-                format!("Session {}", id.as_simple().to_string()[..4].to_uppercase())
-            };
-            count
-        });
+        let name = match params.name {
+            Some(n) => n,
+            None => {
+                let mut used = std::collections::HashSet::new();
+                for sess in self.sessions.read().await.values() {
+                    used.insert(sess.lock().await.info.name.clone());
+                }
+                crate::pet_name::generate(&used)
+            }
+        };
 
         let session_dir = self.data_dir.join("sessions").join(id.to_string());
         let cwd = params.cwd.or_else(|| {
@@ -77,6 +79,7 @@ impl SessionManager {
             pid,
             exit_code: None,
             tags: vec![],
+            workspace_id: params.workspace_id.clone(),
         };
 
         // Subscribe to PTY output for transcript writing
@@ -223,6 +226,22 @@ impl SessionManager {
             task.abort();
         }
         tracing::info!("Killed session {id}");
+        Ok(())
+    }
+
+    /// Set (or clear) a session's workspace_id. Used by the app to adopt
+    /// untagged sessions from legacy daemons into the active workspace.
+    pub async fn set_workspace(
+        &self,
+        id: &SessionId,
+        workspace_id: Option<String>,
+    ) -> Result<()> {
+        let session = self
+            .get(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+        let mut sess = session.lock().await;
+        sess.info.workspace_id = workspace_id;
         Ok(())
     }
 

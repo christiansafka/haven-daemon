@@ -65,6 +65,8 @@ pub struct SessionInfo {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// Parameters for creating a new session.
@@ -77,6 +79,8 @@ pub struct SessionCreate {
     pub kind: SessionKind,
     pub cols: u16,
     pub rows: u16,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// A session template defining how to launch a particular type of session.
@@ -168,6 +172,7 @@ impl Default for SessionCreate {
             kind: SessionKind::Shell,
             cols: 80,
             rows: 24,
+            workspace_id: None,
         }
     }
 }

@@ -71,6 +71,12 @@ pub enum SessionAction {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
 
+        /// Workspace ID to tag this session with. Also automatically
+        /// injected as `HAVEN_WORKSPACE_ID` into the session's shell env
+        /// (agents read it from there).
+        #[arg(long = "workspace", value_name = "ID")]
+        workspace: Option<String>,
+
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -81,6 +87,11 @@ pub enum SessionAction {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Only show sessions tagged with this workspace ID. Sessions with
+        /// no workspace tag (pre-Stage-1 sessions) are always shown.
+        #[arg(long = "workspace", value_name = "ID")]
+        workspace: Option<String>,
     },
 
     /// Attach to a session (stream I/O)

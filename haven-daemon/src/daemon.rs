@@ -491,6 +491,15 @@ async fn handle_connection(
                 }
             }
 
+            Request::SessionSetWorkspace { session_id, workspace_id } => {
+                match sm.set_workspace(&session_id, workspace_id).await {
+                    Ok(_) => Response::WorkspaceSet,
+                    Err(_) => Response::Error(HavenError::SessionNotFound {
+                        session_id: session_id.to_string(),
+                    }),
+                }
+            }
+
             Request::SessionHistory {
                 session_id,
                 offset,

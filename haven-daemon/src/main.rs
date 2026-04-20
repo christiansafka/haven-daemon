@@ -2,6 +2,7 @@ mod cli;
 mod cli_haven;
 mod daemon;
 mod history;
+mod pet_name;
 mod picker;
 mod protocol;
 mod pty;
@@ -117,7 +118,7 @@ fn main() {
 async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Result<()> {
     match action {
         SessionAction::Create {
-            name, shell, cwd, cols, rows, env, json,
+            name, shell, cwd, cols, rows, env, workspace, json,
         } => {
             let mut stream = connect_daemon(socket_path).await?;
             let mut env_map = std::collections::HashMap::new();
@@ -128,8 +129,17 @@ async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Resu
                     eprintln!("Warning: ignoring --env '{entry}' (expected KEY=VALUE)");
                 }
             }
+            // `--workspace` implies `HAVEN_WORKSPACE_ID` in the shell env too,
+            // so agents see it without the caller having to pass --env twice.
+            // An explicit `--env HAVEN_WORKSPACE_ID=...` wins if both are given.
+            if let Some(ref ws) = workspace {
+                env_map
+                    .entry("HAVEN_WORKSPACE_ID".to_string())
+                    .or_insert_with(|| ws.clone());
+            }
             let req = Request::SessionCreate(SessionCreate {
                 name, shell, cwd, cols, rows, env: env_map,
+                workspace_id: workspace,
                 ..Default::default()
             });
             match send_request(&mut stream, 1, &req).await? {
@@ -145,10 +155,24 @@ async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Resu
             }
         }
 
-        SessionAction::List { json } => {
+        SessionAction::List { json, workspace } => {
             let mut stream = connect_daemon(socket_path).await?;
             match send_request(&mut stream, 1, &Request::SessionList).await? {
                 Response::SessionList { sessions } => {
+                    // Filter by workspace if requested. Untagged sessions
+                    // (workspace_id == None) are always included since they
+                    // predate the tag and can belong to any workspace.
+                    let sessions: Vec<_> = if let Some(ref ws) = workspace {
+                        sessions
+                            .into_iter()
+                            .filter(|s| match &s.workspace_id {
+                                Some(id) => id == ws,
+                                None => true,
+                            })
+                            .collect()
+                    } else {
+                        sessions
+                    };
                     if json {
                         println!("{}", serde_json::to_string_pretty(&sessions)?);
                     } else if sessions.is_empty() {

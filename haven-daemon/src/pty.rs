@@ -66,10 +66,31 @@ impl PtyHandle {
             cmd.env("LANG", "en_US.UTF-8");
         }
         if let Ok(home) = std::env::var("HOME") {
-            cmd.env("HOME", home);
+            cmd.env("HOME", &home);
         }
         if let Ok(user) = std::env::var("USER") {
-            cmd.env("USER", user);
+            cmd.env("USER", &user);
+            cmd.env("LOGNAME", &user);
+        }
+        // SHELL tells child processes which shell the user prefers
+        // (used by `$SHELL -c ...` patterns, screen/tmux, etc.)
+        if let Ok(sh) = std::env::var("SHELL") {
+            cmd.env("SHELL", sh);
+        } else {
+            cmd.env("SHELL", shell);
+        }
+        // SSH_AUTH_SOCK is critical for SSH to reach the user's key agent.
+        // Without it, `ssh` falls back to password auth or fails entirely.
+        if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+            cmd.env("SSH_AUTH_SOCK", sock);
+        }
+        // macOS identity / services vars — some tools (especially Go-based
+        // ones like Tailscale) use these for user-identity resolution via
+        // CoreFoundation / XPC when getpwuid() alone isn't sufficient.
+        for key in &["TMPDIR", "__CF_USER_TEXT_ENCODING", "XPC_SERVICE_NAME", "XPC_FLAGS"] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
         }
         // Tag the shell with its session id so tools running inside (like the
         // `haven` CLI) can detect they'd be attaching to their own session.
@@ -123,33 +144,77 @@ impl PtyHandle {
 
             let path_line = path_reassert_sh.as_deref().unwrap_or("");
 
+            // Haven shell integration (OSC 133) — emits semantic prompt
+            // markers so the UI can track where prompts, commands, and
+            // outputs begin/end plus each command's exit code:
+            //   133;A       prompt start
+            //   133;B       command start (end of prompt)
+            //   133;C       command output start
+            //   133;D;CODE  command finished, with exit code
+            // xterm on the Haven side parses these; shells emit them via
+            // their respective hook mechanisms.
             if shell.ends_with("zsh") && !env.contains_key("ZDOTDIR") {
-                // zsh: ZDOTDIR trick — wrapper .zshrc sources the real one,
-                // then overrides PROMPT to show just the directory basename
-                // and re-asserts our bin dir at the head of PATH (rc files
-                // often prepend installer paths that'd otherwise shadow our
-                // `haven` multicall symlink).
-                let wrapper = format!(
-                    "ZDOTDIR=\"{home}\"\n\
-                     [[ -f \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
-                     [[ -f \"$ZDOTDIR/.zshrc\" ]] && source \"$ZDOTDIR/.zshrc\"\n\
-                     PROMPT='%1~ %# '\n\
-                     {path_line}\n"
+                // zsh: ZDOTDIR trick — point zsh at a temp dir whose
+                // .zshrc sources the user's real rc files and then
+                // overrides PROMPT + re-asserts our bin dir on PATH (rc
+                // files often prepend installer paths that'd otherwise
+                // shadow our `haven` multicall symlink).
+                //
+                // CRITICAL: our wrapper .zshenv must NOT reset ZDOTDIR
+                // to $HOME. zsh sources .zshenv → .zprofile → .zshrc,
+                // looking up each at $ZDOTDIR. If we change ZDOTDIR
+                // inside .zshenv, zsh finds the user's real .zshrc at
+                // step 6 instead of our wrapper, and the PROMPT
+                // override never runs.
+                let zshenv_wrapper = format!(
+                    "[[ -f \"{home}/.zshenv\" ]] && source \"{home}/.zshenv\"\n"
                 );
-                let _ = std::fs::write(haven_tmp.join(".zshrc"), wrapper);
-                let _ = std::fs::write(haven_tmp.join(".zshenv"), format!("ZDOTDIR=\"{home}\"\n"));
+                // 133;B lives inside %{ %} so zsh treats it as zero-width
+                // and the prompt column math stays correct. precmd fires
+                // before every prompt render; the previous command's exit
+                // code is still in $? at that moment.
+                let zshrc_wrapper = format!(
+                    "[[ -f \"{home}/.zprofile\" ]] && source \"{home}/.zprofile\"\n\
+                     [[ -f \"{home}/.zshrc\" ]] && source \"{home}/.zshrc\"\n\
+                     PROMPT=$'%1~ %# %{{\\e]133;B\\a%}}'\n\
+                     {path_line}\n\
+                     autoload -Uz add-zsh-hook 2>/dev/null\n\
+                     __haven_precmd() {{ local e=$?; printf '\\e]133;D;%d\\a\\e]133;A\\a' \"$e\"; }}\n\
+                     __haven_preexec() {{ printf '\\e]133;C\\a'; }}\n\
+                     add-zsh-hook precmd __haven_precmd 2>/dev/null\n\
+                     add-zsh-hook preexec __haven_preexec 2>/dev/null\n"
+                );
+                let _ = std::fs::write(haven_tmp.join(".zshenv"), zshenv_wrapper);
+                let _ = std::fs::write(haven_tmp.join(".zshrc"), zshrc_wrapper);
                 cmd.env("ZDOTDIR", haven_tmp.to_string_lossy().as_ref());
             } else if shell.ends_with("bash") && !env.contains_key("PROMPT_COMMAND") {
                 // bash: PROMPT_COMMAND runs after .bashrc/.bash_profile, so
                 // it reliably overrides whatever PS1 they set. We also use it
                 // to idempotently re-assert our bin dir at the head of PATH.
+                //
+                // For OSC 133:
+                //  • ;D and ;A are emitted from PROMPT_COMMAND (exit code
+                //    is the $? at the time the prompt is about to render).
+                //  • ;B is baked into PS1 inside \[ \] so bash ignores it
+                //    for width calc.
+                //  • ;C is emitted from PS0, which bash prints after read
+                //    but before exec — the natural "command started" point.
+                //    Using PS0 avoids the DEBUG-trap double-fire problem.
                 cmd.env(
                     "PROMPT_COMMAND",
-                    format!("{path_line}; PS1='\\W \\$ '"),
+                    format!(
+                        "__haven_e=$?; {path_line}; PS1='\\W \\$ \\[\\e]133;B\\a\\]'; PS0='\\[\\e]133;C\\a\\]'; printf '\\e]133;D;%d\\a\\e]133;A\\a' \"$__haven_e\""
+                    ),
                 );
             } else if shell.ends_with("fish") && !env.contains_key("XDG_CONFIG_HOME") {
                 // fish: XDG_CONFIG_HOME trick — wrapper config.fish sources
                 // the real one, then overrides fish_prompt.
+                //
+                // OSC 133: fish_preexec / fish_postexec are dedicated
+                // event handlers for before/after a command runs, which
+                // maps cleanly to ;C and ;D. ;A/;B are emitted by wrapping
+                // fish_prompt so the user's real prompt stays untouched
+                // (we copy it to __haven_orig_prompt and call around it).
                 let fish_dir = haven_tmp.join("fish");
                 let _ = std::fs::create_dir_all(&fish_dir);
                 let real_config = format!("{home}/.config/fish/config.fish");
@@ -169,7 +234,19 @@ impl PtyHandle {
                      function fish_prompt\n\
                        echo (basename $PWD)' > '\n\
                      end\n\
-                     {fish_path_line}\n"
+                     {fish_path_line}\n\
+                     function __haven_preexec --on-event fish_preexec\n\
+                       printf '\\e]133;C\\a'\n\
+                     end\n\
+                     function __haven_postexec --on-event fish_postexec\n\
+                       printf '\\e]133;D;%d\\a' $status\n\
+                     end\n\
+                     functions -c fish_prompt __haven_orig_prompt 2>/dev/null\n\
+                     function fish_prompt\n\
+                       printf '\\e]133;A\\a'\n\
+                       __haven_orig_prompt\n\
+                       printf '\\e]133;B\\a'\n\
+                     end\n"
                 );
                 let _ = std::fs::write(fish_dir.join("config.fish"), wrapper);
                 cmd.env("XDG_CONFIG_HOME", haven_tmp.to_string_lossy().as_ref());

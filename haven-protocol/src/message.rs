@@ -48,6 +48,14 @@ pub enum Request {
         name: String,
     },
 
+    /// Set (or clear) a session's workspace_id. Used by the app to adopt
+    /// untagged sessions (from legacy daemons) into the currently active
+    /// workspace.
+    SessionSetWorkspace {
+        session_id: SessionId,
+        workspace_id: Option<String>,
+    },
+
     /// Get durable history for a session.
     SessionHistory {
         session_id: SessionId,
@@ -113,6 +121,9 @@ pub enum Response {
 
     /// Session was renamed.
     SessionRenamed,
+
+    /// Session's workspace_id was updated.
+    WorkspaceSet,
 
     /// A chunk of session history.
     HistoryChunk {
