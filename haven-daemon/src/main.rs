@@ -2,7 +2,6 @@ mod cli;
 mod cli_haven;
 mod daemon;
 mod history;
-mod pet_name;
 mod picker;
 mod protocol;
 mod pty;
@@ -253,6 +252,26 @@ async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Resu
             let req = Request::SessionRename { session_id, name: name.clone() };
             match send_request(&mut stream, 1, &req).await? {
                 Response::SessionRenamed => println!("Session renamed to '{name}'."),
+                Response::Error(e) => eprintln!("Error: {e}"),
+                _ => eprintln!("Unexpected response"),
+            }
+        }
+
+        SessionAction::Env { id, keys, json } => {
+            let session_id: uuid::Uuid = id.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid session ID: {e}"))?;
+            let mut stream = connect_daemon(socket_path).await?;
+            let req = Request::SessionGetEnv { session_id, keys: keys.clone() };
+            match send_request(&mut stream, 1, &req).await? {
+                Response::SessionEnv { vars } => {
+                    if json {
+                        println!("{}", serde_json::to_string(&vars)?);
+                    } else {
+                        for (k, v) in vars {
+                            println!("{k}={v}");
+                        }
+                    }
+                }
                 Response::Error(e) => eprintln!("Error: {e}"),
                 _ => eprintln!("Unexpected response"),
             }

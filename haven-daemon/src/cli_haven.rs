@@ -158,6 +158,7 @@ async fn interactive_default(socket_path: &Path) -> Result<i32> {
     // Hide the session we're running inside: attaching to it would be a
     // terminal-inside-terminal loop.
     let self_id = current_session_id();
+    let total = all.len();
     let sessions: Vec<SessionInfo> = all
         .into_iter()
         .filter(|s| Some(s.id) != self_id)
@@ -165,9 +166,16 @@ async fn interactive_default(socket_path: &Path) -> Result<i32> {
 
     match sessions.len() {
         0 => {
-            eprintln!(
-                "[haven] no sessions available — create one from the Haven app first"
-            );
+            if total > 0 && self_id.is_some() {
+                eprintln!(
+                    "[haven] you're already inside the only Haven session — \
+                     open another one from the Haven app to switch into it"
+                );
+            } else {
+                eprintln!(
+                    "[haven] no sessions available — create one from the Haven app first"
+                );
+            }
             Ok(0)
         }
         1 => {

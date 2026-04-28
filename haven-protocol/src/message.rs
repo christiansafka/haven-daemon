@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::error::HavenError;
 use crate::session::{SessionCreate, SessionId, SessionInfo, TranscriptSearchResults};
@@ -54,6 +55,17 @@ pub enum Request {
     SessionSetWorkspace {
         session_id: SessionId,
         workspace_id: Option<String>,
+    },
+
+    /// Read selected env vars from a session's spawn-time environment.
+    /// `keys` filters which vars to return — empty means "all". The daemon
+    /// stores the env it spawned the PTY with; this lets the app recover
+    /// per-session secrets like `HAVEN_SESSION_TOKEN` after its own restart
+    /// (the orchestrator's in-memory token map is wiped, but adopted-legacy
+    /// daemon sessions still hold the original tokens in their PTY env).
+    SessionGetEnv {
+        session_id: SessionId,
+        keys: Vec<String>,
     },
 
     /// Get durable history for a session.
@@ -124,6 +136,10 @@ pub enum Response {
 
     /// Session's workspace_id was updated.
     WorkspaceSet,
+
+    /// Selected env vars from a session's spawn-time environment. Keys
+    /// requested but not present in the env are simply absent from `vars`.
+    SessionEnv { vars: HashMap<String, String> },
 
     /// A chunk of session history.
     HistoryChunk {

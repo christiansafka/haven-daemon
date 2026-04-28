@@ -12,3 +12,4 @@ rmp-serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+rand = "0.8"

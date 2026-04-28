@@ -138,4 +138,20 @@ pub enum SessionAction {
         /// New name
         name: String,
     },
+
+    /// Read selected env vars from a session's spawn-time environment.
+    /// Used by haven-app over SSH to recover per-session secrets like
+    /// HAVEN_SESSION_TOKEN after its own restart.
+    Env {
+        /// Session ID
+        id: String,
+
+        /// Env var names to read (repeatable). If none given, returns all.
+        #[arg(long = "key", value_name = "KEY")]
+        keys: Vec<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }

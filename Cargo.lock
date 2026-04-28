@@ -463,6 +463,7 @@ name = "haven-protocol"
 version = "0.1.4"
 dependencies = [
  "chrono",
+ "rand",
  "rmp-serde",
  "serde",
  "serde_json",

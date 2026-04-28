@@ -15,6 +15,10 @@ pub struct Session {
     pub info: SessionInfo,
     pub pty: PtyHandle,
     pub transcript: TranscriptWriter,
+    /// The extra env vars passed in at session creation (HAVEN_SESSION_TOKEN,
+    /// HAVEN_WORKSPACE_ID, etc.). Retained so the app can recover per-session
+    /// secrets after its own restart — see `Request::SessionGetEnv`.
+    pub env: HashMap<String, String>,
     /// Background task that writes PTY output to transcript
     transcript_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -47,7 +51,7 @@ impl SessionManager {
                 for sess in self.sessions.read().await.values() {
                     used.insert(sess.lock().await.info.name.clone());
                 }
-                crate::pet_name::generate(&used)
+                haven_protocol::pet_name::generate(&used)
             }
         };
 
@@ -88,6 +92,7 @@ impl SessionManager {
             info: info.clone(),
             pty,
             transcript,
+            env: params.env.clone(),
             transcript_task: None,
         }));
 
@@ -243,6 +248,29 @@ impl SessionManager {
         let mut sess = session.lock().await;
         sess.info.workspace_id = workspace_id;
         Ok(())
+    }
+
+    /// Read selected env vars from a session's spawn-time environment.
+    /// `keys` filters which vars to return — empty means "all". Missing keys
+    /// are simply absent from the returned map.
+    pub async fn get_env(
+        &self,
+        id: &SessionId,
+        keys: &[String],
+    ) -> Result<HashMap<String, String>> {
+        let session = self
+            .get(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+        let sess = session.lock().await;
+        let vars = if keys.is_empty() {
+            sess.env.clone()
+        } else {
+            keys.iter()
+                .filter_map(|k| sess.env.get(k).map(|v| (k.clone(), v.clone())))
+                .collect()
+        };
+        Ok(vars)
     }
 
     /// Rename a session.

@@ -500,6 +500,15 @@ async fn handle_connection(
                 }
             }
 
+            Request::SessionGetEnv { session_id, keys } => {
+                match sm.get_env(&session_id, &keys).await {
+                    Ok(vars) => Response::SessionEnv { vars },
+                    Err(_) => Response::Error(HavenError::SessionNotFound {
+                        session_id: session_id.to_string(),
+                    }),
+                }
+            }
+
             Request::SessionHistory {
                 session_id,
                 offset,

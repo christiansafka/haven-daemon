@@ -2,6 +2,7 @@ pub mod error;
 pub mod event;
 pub mod host;
 pub mod message;
+pub mod pet_name;
 pub mod session;
 
 // Re-export commonly used types
