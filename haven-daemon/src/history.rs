@@ -103,14 +103,28 @@ pub struct TranscriptWriter {
 }
 
 impl TranscriptWriter {
-    /// Create a new transcript writer for the given session directory.
-    /// Generates a new encryption key if one doesn't exist, or loads the existing one.
+    /// Create the canonical PTY transcript writer for a session directory.
+    /// Convenience wrapper around `new_with_paths` for the historical
+    /// `transcript.bin` / `transcript.key` filenames.
     pub fn new(session_dir: &Path) -> Result<Self> {
+        Self::new_with_paths(session_dir, "transcript.bin", "transcript.key")
+    }
+
+    /// Open (or create) an encrypted append-only log under `session_dir`,
+    /// using the given filenames for the data file and key file. The same
+    /// key file may be shared across multiple logs in the same session
+    /// (e.g. transcript + activity) — they live in the same directory and
+    /// share a threat model, so a single key keeps file sprawl down.
+    pub fn new_with_paths(
+        session_dir: &Path,
+        data_filename: &str,
+        key_filename: &str,
+    ) -> Result<Self> {
         fs::create_dir_all(session_dir)
             .with_context(|| format!("Failed to create session dir: {}", session_dir.display()))?;
 
-        let path = session_dir.join("transcript.bin");
-        let key_path = session_dir.join("transcript.key");
+        let path = session_dir.join(data_filename);
+        let key_path = session_dir.join(key_filename);
 
         // Load or generate encryption key
         let key = if key_path.exists() {
@@ -219,6 +233,45 @@ impl TranscriptWriter {
         }
 
         Ok(result)
+    }
+
+    /// Read up to `max_bytes` of plaintext ending at `before_offset`
+    /// (exclusive). If `before_offset` is `None`, ends at the current tail.
+    /// Returns `(data, start_offset, total)`.
+    ///
+    /// When the requested window starts mid-record, the leading bytes up to
+    /// the first newline are dropped so the caller sees clean JSONL
+    /// boundaries — used by the activity log paginator. For non-line-oriented
+    /// data this still works (just trims a few bytes from the start). The
+    /// returned `start_offset` is adjusted accordingly so callers can keep
+    /// paging backwards by feeding it back as `before_offset`.
+    pub fn read_tail_before(
+        &self,
+        before_offset: Option<u64>,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, u64, u64)> {
+        let all = self.read_all_plaintext()?;
+        let total = all.len() as u64;
+        let end_u = before_offset.unwrap_or(total).min(total);
+        let end = end_u as usize;
+        let start_u = end_u.saturating_sub(max_bytes);
+        let mut start = start_u as usize;
+        if start > 0 && start < end {
+            // Move forward to the byte after the first newline so we don't
+            // hand back a partial leading record.
+            match all[start..end].iter().position(|&b| b == b'\n') {
+                Some(nl) => start += nl + 1,
+                None => {
+                    // No newline in window → entire window is one partial
+                    // record; nothing safe to return at this slice.
+                    return Ok((Vec::new(), end_u, total));
+                }
+            }
+        }
+        if start >= end {
+            return Ok((Vec::new(), end_u, total));
+        }
+        Ok((all[start..end].to_vec(), start as u64, total))
     }
 
     /// Read and decrypt a range from the transcript.

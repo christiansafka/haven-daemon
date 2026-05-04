@@ -532,6 +532,34 @@ async fn handle_connection(
                 }),
             },
 
+            Request::SessionAppendActivity {
+                session_id,
+                payload,
+            } => match sm.append_activity(&session_id, &payload).await {
+                Ok(_) => Response::ActivityAppended,
+                Err(_) => Response::Error(HavenError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                }),
+            },
+
+            Request::SessionActivityHistory {
+                session_id,
+                before_offset,
+                tail_bytes,
+            } => match sm
+                .read_activity_tail(&session_id, before_offset, tail_bytes)
+                .await
+            {
+                Ok((data, start_offset, total)) => Response::ActivityChunk {
+                    data,
+                    start_offset,
+                    total,
+                },
+                Err(_) => Response::Error(HavenError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                }),
+            },
+
             Request::SessionSearchHistory {
                 session_id,
                 pattern,

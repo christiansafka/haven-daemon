@@ -75,6 +75,27 @@ pub enum Request {
         length: u64,
     },
 
+    /// Append a single activity event (a Claude Code hook payload) to the
+    /// session's encrypted activity log. Stored alongside the PTY transcript
+    /// in the session dir; `payload` is opaque JSON bytes with a trailing
+    /// newline already attached by the caller (one event per JSONL line).
+    /// Best-effort: callers should never block UI on this.
+    SessionAppendActivity {
+        session_id: SessionId,
+        payload: Vec<u8>,
+    },
+
+    /// Read a tail of the session's activity log. Returns at most `tail_bytes`
+    /// of decrypted plaintext ending at `before_offset` (exclusive). When
+    /// `before_offset` is `None`, returns the very tail of the log. Callers
+    /// pass the returned `start_offset` back as the next `before_offset` to
+    /// page backwards through older history.
+    SessionActivityHistory {
+        session_id: SessionId,
+        before_offset: Option<u64>,
+        tail_bytes: u64,
+    },
+
     /// Search a session's full durable history.
     SessionSearchHistory {
         session_id: SessionId,
@@ -145,6 +166,21 @@ pub enum Response {
     HistoryChunk {
         data: Vec<u8>,
         offset: u64,
+        total: u64,
+    },
+
+    /// Activity event was appended to the log.
+    ActivityAppended,
+
+    /// A chunk of session activity history. `data` is JSONL plaintext (one
+    /// hook event per line, terminated by `\n`). `start_offset` is the byte
+    /// offset of the first byte of `data` within the activity log's
+    /// plaintext stream — pass this back as `before_offset` to page older.
+    /// `total` is the current full plaintext length (so the UI can hide the
+    /// "load earlier" affordance when `start_offset == 0`).
+    ActivityChunk {
+        data: Vec<u8>,
+        start_offset: u64,
         total: u64,
     },
 

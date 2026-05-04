@@ -139,6 +139,34 @@ pub enum SessionAction {
         name: String,
     },
 
+    /// Append a single Claude Code hook event to the session's encrypted
+    /// activity log. Reads the JSON payload from stdin (one event per
+    /// invocation). A trailing newline is added if absent so the on-disk
+    /// log stays valid JSONL. Best-effort: failures are logged and exit 0
+    /// so the calling hook script never blocks the agent.
+    RecordActivity {
+        /// Session ID
+        id: String,
+    },
+
+    /// Read a tail of the session's encrypted activity log as JSONL.
+    /// Prints `{"start":N,"total":M}` on the first line followed by the
+    /// decrypted JSONL payload. Used by haven-app to seed the activity
+    /// timeline on session attach (and to page older history).
+    Activity {
+        /// Session ID
+        id: String,
+
+        /// How many bytes of activity to return.
+        #[arg(long, default_value_t = 65_536)]
+        tail_bytes: u64,
+
+        /// When set, return bytes ending strictly before this byte offset
+        /// in the activity log's plaintext stream. Used to page older.
+        #[arg(long)]
+        before: Option<u64>,
+    },
+
     /// Read selected env vars from a session's spawn-time environment.
     /// Used by haven-app over SSH to recover per-session secrets like
     /// HAVEN_SESSION_TOKEN after its own restart.

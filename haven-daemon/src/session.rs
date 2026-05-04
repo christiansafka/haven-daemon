@@ -15,6 +15,10 @@ pub struct Session {
     pub info: SessionInfo,
     pub pty: PtyHandle,
     pub transcript: TranscriptWriter,
+    /// Encrypted append-only JSONL log of Claude Code hook events for this
+    /// session. Shares the per-session encryption key with `transcript`.
+    /// Written via `SessionAppendActivity`, read via `SessionActivityHistory`.
+    pub activity: TranscriptWriter,
     /// The extra env vars passed in at session creation (HAVEN_SESSION_TOKEN,
     /// HAVEN_WORKSPACE_ID, etc.). Retained so the app can recover per-session
     /// secrets after its own restart — see `Request::SessionGetEnv`.
@@ -70,6 +74,12 @@ impl SessionManager {
         let transcript = TranscriptWriter::new(&session_dir)
             .context("Failed to create transcript writer")?;
 
+        // Activity log — same key, separate data file. Lives in the same dir
+        // so `transcript.key` is shared (single key, less file sprawl).
+        let activity =
+            TranscriptWriter::new_with_paths(&session_dir, "activity.bin", "transcript.key")
+                .context("Failed to create activity writer")?;
+
         let info = SessionInfo {
             id,
             name,
@@ -92,6 +102,7 @@ impl SessionManager {
             info: info.clone(),
             pty,
             transcript,
+            activity,
             env: params.env.clone(),
             transcript_task: None,
         }));
@@ -204,6 +215,34 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
         let sess = session.lock().await;
         sess.transcript.search(pattern, case_insensitive, regex, limit)
+    }
+
+    /// Append a single hook payload to the session's encrypted activity log.
+    /// `payload` should be a complete JSON object followed by a single `\n`
+    /// so the on-disk log is valid JSONL.
+    pub async fn append_activity(&self, id: &SessionId, payload: &[u8]) -> Result<()> {
+        let session = self
+            .get(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+        let mut sess = session.lock().await;
+        sess.activity.append(payload)
+    }
+
+    /// Read a tail of the session's activity log, ending at `before_offset`
+    /// (or the current tail when `None`). Returns `(jsonl_bytes, start, total)`.
+    pub async fn read_activity_tail(
+        &self,
+        id: &SessionId,
+        before_offset: Option<u64>,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, u64, u64)> {
+        let session = self
+            .get(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+        let sess = session.lock().await;
+        sess.activity.read_tail_before(before_offset, max_bytes)
     }
 
     /// Get recent history for a session.

@@ -257,6 +257,84 @@ async fn handle_cli_action(action: SessionAction, socket_path: &PathBuf) -> Resu
             }
         }
 
+        SessionAction::RecordActivity { id } => {
+            let session_id: uuid::Uuid = id
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid session ID: {e}"))?;
+
+            // Slurp stdin → daemon. Best-effort: a missing daemon, an unknown
+            // session, or any other failure is logged and we still exit 0 so
+            // the upstream hook script never blocks the agent.
+            use tokio::io::{stdin, AsyncReadExt};
+            let mut buf = Vec::with_capacity(2048);
+            let mut s = stdin();
+            if let Err(e) = s.read_to_end(&mut buf).await {
+                eprintln!("record-activity: read stdin failed: {e}");
+                return Ok(());
+            }
+            // Always end with a single newline so the log stays valid JSONL.
+            if !buf.ends_with(b"\n") {
+                buf.push(b'\n');
+            }
+
+            let mut stream = match connect_daemon(socket_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("record-activity: connect failed: {e}");
+                    return Ok(());
+                }
+            };
+            let req = Request::SessionAppendActivity {
+                session_id,
+                payload: buf,
+            };
+            match send_request(&mut stream, 1, &req).await {
+                Ok(Response::ActivityAppended) => {}
+                Ok(Response::Error(e)) => eprintln!("record-activity: {e}"),
+                Ok(_) => eprintln!("record-activity: unexpected response"),
+                Err(e) => eprintln!("record-activity: {e}"),
+            }
+        }
+
+        SessionAction::Activity {
+            id,
+            tail_bytes,
+            before,
+        } => {
+            let session_id: uuid::Uuid = id
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid session ID: {e}"))?;
+            let mut stream = connect_daemon(socket_path).await?;
+            let req = Request::SessionActivityHistory {
+                session_id,
+                before_offset: before,
+                tail_bytes,
+            };
+            match send_request(&mut stream, 1, &req).await? {
+                Response::ActivityChunk {
+                    data,
+                    start_offset,
+                    total,
+                } => {
+                    // Header line so the app can parse pagination metadata
+                    // before consuming the body. JSON object on its own line —
+                    // never collides with JSONL events because no event has
+                    // these exact fields at top level.
+                    println!(r#"{{"haven_activity":1,"start":{start_offset},"total":{total}}}"#);
+                    use std::io::Write;
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    out.write_all(&data)?;
+                    out.flush()?;
+                }
+                Response::Error(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+                _ => eprintln!("Unexpected response"),
+            }
+        }
+
         SessionAction::Env { id, keys, json } => {
             let session_id: uuid::Uuid = id.parse()
                 .map_err(|e| anyhow::anyhow!("Invalid session ID: {e}"))?;
