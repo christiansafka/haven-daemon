@@ -35,6 +35,7 @@ impl PtyHandle {
         cols: u16,
         rows: u16,
         session_id: &str,
+        last_cwd_path: Option<PathBuf>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
 
@@ -316,6 +317,9 @@ impl PtyHandle {
                                 if cwd_tx.send(osc7.into_bytes()).is_err() {
                                     break; // No subscribers, session ended
                                 }
+                                if let Some(path) = last_cwd_path.as_ref() {
+                                    persist_last_cwd(path, &cwd);
+                                }
                             }
                             None => break, // Process gone
                             _ => {}
@@ -465,4 +469,14 @@ fn gethostname() -> String {
     std::str::from_utf8(&buf[..nul_pos])
         .unwrap_or("localhost")
         .to_string()
+}
+
+fn persist_last_cwd(path: &std::path::Path, cwd: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, cwd).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }

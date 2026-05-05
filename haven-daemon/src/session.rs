@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use haven_protocol::{SessionCreate, SessionId, SessionInfo, SessionStatus};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
@@ -60,13 +60,20 @@ impl SessionManager {
         };
 
         let session_dir = self.data_dir.join("sessions").join(id.to_string());
-        let cwd = params.cwd.or_else(|| {
-            dirs::home_dir()
-        });
+        let last_cwd_path = self.data_dir.join("last_cwd");
+        let cwd = params.cwd.or_else(|| read_last_cwd(&last_cwd_path)).or_else(dirs::home_dir);
 
         // Spawn PTY
-        let pty = PtyHandle::spawn(&shell, cwd.as_ref(), &params.env, params.cols, params.rows, &id.to_string())
-            .context("Failed to spawn PTY")?;
+        let pty = PtyHandle::spawn(
+            &shell,
+            cwd.as_ref(),
+            &params.env,
+            params.cols,
+            params.rows,
+            &id.to_string(),
+            Some(last_cwd_path),
+        )
+        .context("Failed to spawn PTY")?;
 
         let pid = pty.pid();
 
@@ -349,6 +356,20 @@ impl SessionManager {
             }
         }
         tracing::info!("kill_all: drained {n} sessions");
+    }
+}
+
+fn read_last_cwd(path: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(trimmed);
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
     }
 }
 
